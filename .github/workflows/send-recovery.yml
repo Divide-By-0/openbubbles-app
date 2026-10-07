@@ -1,0 +1,14 @@
+name: Send recovery regression
+on: [push, pull_request]
+jobs:
+  send-recovery:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: '3.6.2'
+      - name: Preserve confirmed receipts during service recovery
+        run: python3 tool/test_send_recovery.py
+      - name: Preserve incoming messages across handler failures
+        run: python3 tool/test_incoming_delivery.py

@@ -63,6 +63,10 @@ const clientId = '1041242226917-ik21n86fp43e82iu1e5soh6bu6gvuste.apps.googleuser
 const clientSecret = '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';
 
 
+String _diagnosticHash(String value) => sha256.convert(utf8.encode(value)).toString().substring(0, 12);
+
+String _durationMs(Stopwatch stopwatch) => stopwatch.elapsedMilliseconds.toString();
+
 class SyncIsolate {
   static void initialize() {
     ui.CallbackHandle callbackHandle = ui.PluginUtilities.getCallbackHandle(backgroundSyncIsolate)!;
@@ -3140,13 +3144,8 @@ class RustPushService extends GetxService {
     Chat.softDelete(chat);
   }
 
-  Future handleMsg(api.PushMessage push, bool finalAttempt) async {
-    try {
-      await handleMsgInner(push).timeout(const Duration(minutes: 3));
-    } catch (e, s) {
-      if (finalAttempt) markCertified(push);
-      rethrow;
-    }
+  Future handleMsg(api.PushMessage push) async {
+    await handleMsgInner(push).timeout(const Duration(minutes: 3));
     // if we complete successfully, mark delivery "certified"
     markCertified(push);
   }
@@ -3704,7 +3703,10 @@ class RustPushService extends GetxService {
         var lastNotifiedAnyways = message.chat.target!.dateNotifiedAnyways;
         message.wasDeliveredQuietly = lastNotifiedAnyways == null || DateTime.now().difference(lastNotifiedAnyways).inMinutes > 5;
       }
-      message.save();
+      // A verified recipient receipt settles the send even if the asynchronous
+      // SendConfirm is delayed or lost during service recovery.
+      message.sendingServiceId = null;
+      message.save(updateSendingServiceId: true);
       inq.queue(IncomingItem(
         chat: message.chat.target!,
         message: message,
@@ -3791,9 +3793,11 @@ class RustPushService extends GetxService {
             myMsg.target = otherIds.map((element) => api.MessageTarget.uuid(element)).toList(); // forward to other devices
             await (backend as RustPushBackend).sendMsg(myMsg);
           }
-          var msg = (await pushService.reflectMessageDyn(myMsg))!;
-          msg.temp = true;
-          msg.forwardIfNessesary(chat);
+          final msg = await pushService.reflectMessageDyn(myMsg);
+          if (msg != null) {
+            msg.temp = true;
+            await msg.forwardIfNessesary(chat);
+          }
           return;
         }
       }
@@ -3806,16 +3810,23 @@ class RustPushService extends GetxService {
         return;
       }
     }
-    Logger.info("Reflecting ${myMsg.id}");
+    final receiveStopwatch = Stopwatch()..start();
+    final receiveId = _diagnosticHash(myMsg.id);
+    Logger.info("rustpush_receive reflection_start id=$receiveId");
     var reflected = await pushService.reflectMessageDyn(myMsg);
-    Logger.info("Reflect finished ${myMsg.id}");
+    Logger.info("rustpush_receive reflection_complete id=$receiveId duration_ms=${_durationMs(receiveStopwatch)} reflected=${reflected != null}");
     if (reflected != null) {
-      Logger.info("Queing");
+      final queueStopwatch = Stopwatch()..start();
+      final queueCompletion = Completer<void>();
+      Logger.info("rustpush_receive incoming_queue_enqueue id=$receiveId pending_count=${inq.items.length}");
       await inq.queue(IncomingItem(
         chat: chat,
         message: reflected,
-        type: QueueType.newMessage
+        type: QueueType.newMessage,
+        completer: queueCompletion,
       ));
+      await queueCompletion.future;
+      Logger.info("rustpush_receive incoming_queue_complete id=$receiveId duration_ms=${_durationMs(queueStopwatch)} pending_count=${inq.items.length}");
     }
   }
 
@@ -4469,37 +4480,39 @@ class RustPushService extends GetxService {
     }
   }
 
-  Future<void> markAsHandledAfter(String ptr) async {
-    if (inq.isProcessing.value) {
-      Logger.info("Marking as handled processing wait $ptr");
-      await for (final value in inq.isProcessing.stream) {
-        if (!value) break;
-      }
-    }
-    Logger.info("Marking as handled commit $ptr");
+  Future<void> markAsHandledAfter(String ptr, {required String eventId, required int retry}) async {
+    final ackStopwatch = Stopwatch()..start();
+    // handleMsg awaits the completion for this pointer's queue item. Do not
+    // wait for unrelated incoming work before acknowledging this message.
+    Logger.info("rustpush_receive durable_work_complete id=$eventId retry=$retry pending_count=${inq.items.length}");
+    Logger.info("rustpush_receive ack_commit id=$eventId retry=$retry");
     await api.completeMsg(ptr: ptr);
+    Logger.info("rustpush_receive ack_complete id=$eventId retry=$retry duration_ms=${_durationMs(ackStopwatch)}");
   }
 
   Future recievedMsgPointer(String pointer, String retry) async {
+    final eventId = _diagnosticHash(pointer);
+    final retryCount = int.tryParse(retry) ?? 3;
+    final receiveStopwatch = Stopwatch()..start();
     var message = await api.ptrToDart(ptr: pointer);
     if (message == null) {
-      Logger.info("bad pointer $pointer $retry");
+      Logger.info("rustpush_receive pointer_missing id=$eventId retry=$retryCount");
       return;
     }
-    Logger.info("waitingForInit $pointer $retry");
+    final initStopwatch = Stopwatch()..start();
+    Logger.info("rustpush_receive aps_init_wait_start id=$eventId retry=$retryCount");
     await initFuture;
-    var isFinal = (int.tryParse(retry) ?? 3) >= 3;
+    Logger.info("rustpush_receive aps_init_wait_complete id=$eventId retry=$retryCount duration_ms=${_durationMs(initStopwatch)} total_ms=${_durationMs(receiveStopwatch)}");
     try {
-      Logger.info("Handling $pointer $retry");
-      await handleMsg(message, isFinal);
-      Logger.info("Marking as handled $pointer");
-      await markAsHandledAfter(pointer);
+      final handlingStopwatch = Stopwatch()..start();
+      Logger.info("rustpush_receive handle_start id=$eventId retry=$retryCount");
+      await handleMsg(message);
+      Logger.info("rustpush_receive handle_complete id=$eventId retry=$retryCount duration_ms=${_durationMs(handlingStopwatch)} total_ms=${_durationMs(receiveStopwatch)}");
+      await markAsHandledAfter(pointer, eventId: eventId, retry: retryCount);
     } catch (e, s) {
       Logger.error("Handle failed", error: e, trace: s);
-      if (isFinal) {
-        Logger.info("Failed; Marking as handled anyways $pointer");
-        await markAsHandledAfter(pointer);
-      }
+      // Leave the pointer pending so the native bounded retry loop can try
+      // again. A failed handler must never be acknowledged as delivered.
       rethrow;
     }
   }
@@ -4520,7 +4533,7 @@ class RustPushService extends GetxService {
         if (msg == null) {
           continue;
         }
-        await handleMsg(msg, true);
+        await handleMsg(msg);
       } catch (e, t) {
         // if there was an error somewhere, log it and move on.
         // don't stop our loop
@@ -4887,6 +4900,8 @@ class RustPushService extends GetxService {
       if (item.sendingServiceId == serviceId) continue;
       item.sendingServiceId = null;
       item = item.save(updateSendingServiceId: true);
+      // Losing the sender service does not invalidate a recipient receipt.
+      if (item.isDelivered || item.dateRead != null) continue;
       markFailed(item, "Crashed while still sending");
     }
     if (ls.isUiThread) await cs.refreshContacts();
