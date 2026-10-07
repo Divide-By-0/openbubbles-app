@@ -10,3 +10,5 @@ jobs:
           sdk: '3.6.2'
       - name: Preserve confirmed receipts during service recovery
         run: python3 tool/test_send_recovery.py
+      - name: Preserve incoming messages across handler failures
+        run: python3 tool/test_incoming_delivery.py
