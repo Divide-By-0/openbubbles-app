@@ -3704,7 +3704,10 @@ class RustPushService extends GetxService {
         var lastNotifiedAnyways = message.chat.target!.dateNotifiedAnyways;
         message.wasDeliveredQuietly = lastNotifiedAnyways == null || DateTime.now().difference(lastNotifiedAnyways).inMinutes > 5;
       }
-      message.save();
+      // A verified recipient receipt settles the send even if the asynchronous
+      // SendConfirm is delayed or lost during service recovery.
+      message.sendingServiceId = null;
+      message.save(updateSendingServiceId: true);
       inq.queue(IncomingItem(
         chat: message.chat.target!,
         message: message,
@@ -4887,6 +4890,8 @@ class RustPushService extends GetxService {
       if (item.sendingServiceId == serviceId) continue;
       item.sendingServiceId = null;
       item = item.save(updateSendingServiceId: true);
+      // Losing the sender service does not invalidate a recipient receipt.
+      if (item.isDelivered || item.dateRead != null) continue;
       markFailed(item, "Crashed while still sending");
     }
     if (ls.isUiThread) await cs.refreshContacts();
